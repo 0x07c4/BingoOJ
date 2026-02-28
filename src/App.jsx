@@ -13,6 +13,9 @@ const STATEMENT_TRANSLATION_CACHE_KEY = "bingooj:cf:translation:v3";
 const DRAFT_CACHE_KEY = "bingooj:drafts:v1";
 const PROBLEM_LIST_CACHE_MAX_AGE = 1000 * 60 * 30;
 const STATEMENT_CACHE_MAX_AGE = 1000 * 60 * 60 * 24 * 7;
+const MATH_DELIMITER_PATTERN = /(\${1,3})([\s\S]+?)\1/g;
+const MATH_SKIP_TAGS = new Set(["CODE", "KBD", "PRE", "SCRIPT", "STYLE", "TEXTAREA"]);
+let katexRuntimePromise = null;
 
 const LANGUAGES = {
   cpp: {
@@ -207,6 +210,117 @@ function buildLineDiff(expected, got) {
   };
 }
 
+async function loadKatexRuntime() {
+  if (!katexRuntimePromise) {
+    katexRuntimePromise = Promise.all([
+      import("katex"),
+      import("katex/dist/katex.min.css"),
+    ]).then(([katexModule]) => katexModule.default);
+  }
+
+  return katexRuntimePromise;
+}
+
+function hasRenderableMath(rawHtml) {
+  return typeof rawHtml === "string" && rawHtml.includes("$");
+}
+
+function normalizeStatementLabels(doc, language) {
+  if (language !== "zh") return;
+
+  const setText = (selector, text) => {
+    const node = doc.querySelector(selector);
+    if (node) node.textContent = text;
+  };
+
+  const setAllText = (selector, getText) => {
+    doc.querySelectorAll(selector).forEach((node, index) => {
+      node.textContent = getText(index);
+    });
+  };
+
+  setText(".input-specification .section-title", "输入");
+  setText(".output-specification .section-title", "输出");
+  setText(".sample-tests .section-title", "示例");
+  setText(".note .section-title", "说明");
+
+  setAllText(".sample-test .input .title", () => "输入");
+  setAllText(".sample-test .output .title", () => "输出");
+}
+
+function formatStatementHtml(rawHtml, katex, language) {
+  if (!rawHtml || typeof window === "undefined") return rawHtml ?? "";
+
+  const parser = new window.DOMParser();
+  const doc = parser.parseFromString(rawHtml, "text/html");
+  normalizeStatementLabels(doc, language);
+  const walker = doc.createTreeWalker(doc.body, window.NodeFilter.SHOW_TEXT);
+  const textNodes = [];
+
+  while (walker.nextNode()) {
+    textNodes.push(walker.currentNode);
+  }
+
+  for (const node of textNodes) {
+    const parent = node.parentElement;
+    const text = node.textContent ?? "";
+    if (!parent || !text.includes("$") || MATH_SKIP_TAGS.has(parent.tagName)) {
+      continue;
+    }
+
+    MATH_DELIMITER_PATTERN.lastIndex = 0;
+    if (!MATH_DELIMITER_PATTERN.test(text)) {
+      continue;
+    }
+
+    const fragment = doc.createDocumentFragment();
+    let lastIndex = 0;
+
+    text.replace(MATH_DELIMITER_PATTERN, (fullMatch, delimiter, formula, offset) => {
+      if (offset > lastIndex) {
+        fragment.append(doc.createTextNode(text.slice(lastIndex, offset)));
+      }
+
+      const textBefore = text.slice(0, offset).trim();
+      const textAfter = text.slice(offset + fullMatch.length).trim();
+      const isBlockLike =
+        formula.includes("\n") ||
+        ((textBefore.length === 0 && textAfter.length === 0) && formula.trim().length > 48);
+
+      try {
+        const rendered = katex.renderToString(formula.trim(), {
+          displayMode: isBlockLike,
+          throwOnError: false,
+          strict: "ignore",
+          trust: false,
+        });
+        const wrapper = doc.createElement(isBlockLike ? "div" : "span");
+        wrapper.className = isBlockLike ? "cf-math-block" : "cf-math-inline";
+        wrapper.innerHTML = rendered;
+        fragment.append(wrapper);
+      } catch {
+        const fallback = doc.createElement(isBlockLike ? "div" : "span");
+        fallback.className = isBlockLike
+          ? "cf-math-block cf-math-block-fallback"
+          : "cf-math-inline cf-math-inline-fallback";
+        fallback.textContent = formula.trim();
+        fragment.append(fallback);
+      }
+
+      lastIndex = offset + fullMatch.length;
+      return fullMatch;
+    });
+
+    if (lastIndex < text.length) {
+      fragment.append(doc.createTextNode(text.slice(lastIndex)));
+    }
+
+    parent.replaceChild(fragment, node);
+  }
+
+  return doc.body.innerHTML;
+}
+
 export default function App() {
   const [selectedId, setSelectedId] = useState("");
   const [problems, setProblems] = useState([]);
@@ -302,8 +416,44 @@ export default function App() {
       : null;
   const translatedStatementHtml =
     problem?.statementTranslations?.[statementLanguage] ?? null;
-  const displayedStatementHtml =
+  const rawStatementHtml =
     statementLanguage === "zh" ? translatedStatementHtml : problem?.statement_html;
+  const [displayedStatementHtml, setDisplayedStatementHtml] = useState(rawStatementHtml ?? "");
+
+  useEffect(() => {
+    let alive = true;
+    const nextHtml = rawStatementHtml ?? "";
+
+    if (!nextHtml) {
+      setDisplayedStatementHtml("");
+      return () => {
+        alive = false;
+      };
+    }
+
+    if (!hasRenderableMath(nextHtml)) {
+      setDisplayedStatementHtml(formatStatementHtml(nextHtml, null, statementLanguage));
+      return () => {
+        alive = false;
+      };
+    }
+
+    setDisplayedStatementHtml(nextHtml);
+    (async () => {
+      try {
+        const katex = await loadKatexRuntime();
+        if (!alive) return;
+        setDisplayedStatementHtml(formatStatementHtml(nextHtml, katex, statementLanguage));
+      } catch {
+        if (!alive) return;
+        setDisplayedStatementHtml(nextHtml);
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [rawStatementHtml, statementLanguage]);
 
   async function refreshTranslationSupport() {
     try {
@@ -757,21 +907,37 @@ export default function App() {
         <section className="content">
           <div className="panel statement">
             <div className="statement-toolbar">
-              <div>
+              <div className="statement-toolbar-copy">
+                <div className="statement-kicker">Problem Statement</div>
                 <div className="section-title">Statement</div>
-                <div className="sample-subtitle">
-                  {statementLanguage === "zh" ? "中文(本地机翻)" : "English original"}
+                <div className="statement-meta-row">
+                  <div className="statement-mode">
+                    {statementLanguage === "zh"
+                      ? "Chinese local translation"
+                      : "Codeforces original"}
+                  </div>
+                  {samples.length ? (
+                    <div className="statement-meta-muted">
+                      {samples.length} sample{samples.length > 1 ? "s" : ""}
+                    </div>
+                  ) : null}
                 </div>
               </div>
               <div className="statement-language-toggle">
                 <button
-                  className={"workspace-tab " + (statementLanguage === "en" ? "active" : "")}
+                  className={
+                    "statement-language-button " +
+                    (statementLanguage === "en" ? "active" : "")
+                  }
                   onClick={() => setStatementLanguage("en")}
                 >
                   English
                 </button>
                 <button
-                  className={"workspace-tab " + (statementLanguage === "zh" ? "active" : "")}
+                  className={
+                    "statement-language-button " +
+                    (statementLanguage === "zh" ? "active" : "")
+                  }
                   onClick={() => setStatementLanguage("zh")}
                 >
                   中文
@@ -860,9 +1026,12 @@ export default function App() {
                     Local translation warning: {translationError}
                   </div>
                 ) : null}
-                <div className="cf-statement"
-                  dangerouslySetInnerHTML={{ __html: displayedStatementHtml }}
-                />
+                <div className="statement-body">
+                  <div
+                    className="cf-statement"
+                    dangerouslySetInnerHTML={{ __html: displayedStatementHtml }}
+                  />
+                </div>
               </>
             ) : (
               <ReactMarkdown>{problem?.statementMd ?? ""}</ReactMarkdown>

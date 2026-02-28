@@ -254,6 +254,9 @@ select, .btn {
 .statement {
   grid-row: 1 / span 2;
   line-height: 1.68;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .statement-toolbar {
@@ -261,15 +264,83 @@ select, .btn {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  padding-bottom: 12px;
-  margin-bottom: 14px;
+  padding: 16px 18px 12px;
   border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: linear-gradient(180deg, rgba(18, 21, 24, 0.98), rgba(18, 21, 24, 0.94));
+  backdrop-filter: blur(10px);
+}
+
+.statement-toolbar-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.statement-kicker {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.statement-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.statement-mode {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.statement-meta-muted {
+  color: var(--text-faint);
+  font-size: 12px;
 }
 
 .statement-language-toggle {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  padding: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: rgba(8, 10, 12, 0.72);
+}
+
+.statement-language-button {
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.statement-language-button:hover {
+  color: var(--text-main);
+}
+
+.statement-language-button.active {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-strong);
 }
 
 .statement-status {
@@ -363,13 +434,17 @@ select, .btn {
 }
 
 .statement-inline-note {
-  margin-bottom: 12px;
+  margin: 16px 18px 0;
   padding: 10px 12px;
   border: 1px solid #5c4e35;
   border-radius: 12px;
   background: #18140d;
   color: #dbc69d;
   font-size: 12px;
+}
+
+.statement-body {
+  padding: 18px 18px 24px;
 }
 
 .statement p,
@@ -391,91 +466,264 @@ select, .btn {
 
 .cf-statement {
   color: var(--text-main);
+  max-width: 820px;
 }
 
 .cf-statement .header {
-  margin-bottom: 20px;
-  padding-bottom: 14px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 24px;
+  margin-bottom: 26px;
+  padding: 0 0 16px;
   border-bottom: 1px solid var(--border);
 }
 
 .cf-statement .title {
+  grid-column: 1 / -1;
   font-size: 24px;
   font-weight: 760;
   line-height: 1.25;
   color: var(--text-strong);
+  margin: 0;
 }
 
 .cf-statement .time-limit,
 .cf-statement .memory-limit,
 .cf-statement .input-file,
 .cf-statement .output-file {
-  color: var(--text-muted);
-  font-size: 13px;
-  margin-top: 4px;
+  margin: 0;
+  padding: 0;
+  color: var(--text-main);
+  font-size: 14px;
+  line-height: 1.45;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cf-statement .property-title {
+  display: block;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .cf-statement .section-title,
 .cf-statement .input-specification .section-title,
 .cf-statement .output-specification .section-title,
 .cf-statement .note .section-title {
-  margin-top: 24px;
+  margin-top: 28px;
   margin-bottom: 10px;
-  font-size: 17px;
+  font-size: 18px;
   font-weight: 760;
   color: var(--text-strong);
+  letter-spacing: -0.01em;
+}
+
+.cf-statement .header + * .section-title,
+.cf-statement > .section-title:first-of-type {
+  margin-top: 22px;
+}
+
+.cf-statement .input-specification,
+.cf-statement .output-specification,
+.cf-statement .sample-tests,
+.cf-statement .note {
+  position: relative;
+}
+
+.cf-statement .input-specification::before,
+.cf-statement .output-specification::before,
+.cf-statement .sample-tests::before,
+.cf-statement .note::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 44px;
+  height: 1px;
+  background: rgba(141, 166, 186, 0.38);
 }
 
 .cf-statement p {
   margin: 0;
+  font-size: 15px;
+  line-height: 1.72;
 }
 
 .cf-statement p + p,
 .cf-statement ul,
 .cf-statement ol {
-  margin-top: 0.95em;
+  margin-top: 0.82em;
 }
 
 .cf-statement ul,
 .cf-statement ol {
-  padding-left: 1.4em;
+  padding-left: 1.5em;
+}
+
+.cf-statement p + ul,
+.cf-statement p + ol,
+.cf-statement ul + p,
+.cf-statement ol + p {
+  margin-top: 0.72em;
 }
 
 .cf-statement li + li {
-  margin-top: 0.45em;
+  margin-top: 0.38em;
 }
 
 .cf-statement .sample-tests {
-  margin-top: 26px;
+  margin-top: 30px;
 }
 
 .cf-statement .sample-test {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  align-items: start;
 }
 
 .cf-statement .sample-test .input,
 .cf-statement .sample-test .output {
   margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 16px;
+  background: rgba(8, 10, 12, 0.78);
 }
 
 .cf-statement .sample-test .title {
+  grid-column: 1 / -1;
   font-size: 13px;
   font-weight: 650;
-  color: var(--text-muted);
+  color: var(--text-faint);
   margin-bottom: 6px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 
 .cf-statement pre {
-  margin-top: 6px;
+  margin-top: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
   white-space: pre-wrap;
   word-break: break-word;
+  font-size: 14px;
+  line-height: 1.55;
 }
 
 .cf-statement code {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 0.95em;
+}
+
+.cf-statement p code,
+.cf-statement li code {
+  display: inline-block;
+  padding: 0.1em 0.38em;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #d9e6ef;
+}
+
+.cf-statement .cf-math-inline {
+  display: inline-block;
+  margin: 0 0.15em;
+  padding: 0.08em 0.28em;
+  border-radius: 8px;
+  background: rgba(125, 149, 171, 0.08);
+  border: 1px solid rgba(125, 149, 171, 0.12);
+  color: #d7e3f7;
+  vertical-align: middle;
+}
+
+.cf-statement .cf-math-block {
+  display: block;
+  margin: 0.9em 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(18, 24, 30, 0.78);
+  border: 1px solid rgba(117, 144, 166, 0.2);
+  color: #d7e3f7;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.95em;
+  line-height: 1.55;
+  overflow-x: auto;
+}
+
+.cf-statement .cf-math-inline .katex,
+.cf-statement .cf-math-block .katex,
+.cf-statement .tex-span,
+.cf-statement .MathJax,
+.cf-statement .MathJax_Display {
+  color: #d7e3f7;
+}
+
+.cf-statement .cf-math-block .katex-display {
+  margin: 0;
+}
+
+.cf-statement .MathJax_Display,
+.cf-statement .formula,
+.cf-statement .cf-math-block-fallback {
+  margin: 1.05em 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(18, 24, 30, 0.78);
+  border: 1px solid rgba(117, 144, 166, 0.2);
+  overflow-x: auto;
+}
+
+.cf-statement .cf-math-inline-fallback {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.94em;
+}
+
+.cf-statement .note {
+  margin-top: 24px;
+  padding: 14px 16px;
+  border-left: 3px solid #6d8999;
+  border-radius: 0 14px 14px 0;
+  background: rgba(20, 25, 29, 0.72);
+}
+
+.cf-statement .note .section-title {
+  margin-top: 0;
+}
+
+@media (max-width: 900px) {
+  .statement-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 14px 14px 10px;
+  }
+
+  .statement-body {
+    padding: 14px 14px 20px;
+  }
+
+  .statement-language-toggle {
+    align-self: flex-start;
+  }
+
+  .cf-statement .header {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    padding-bottom: 14px;
+  }
+
+  .cf-statement .title {
+    font-size: 22px;
+  }
+
+  .cf-statement .sample-test {
+    grid-template-columns: 1fr;
+  }
 }
 .editor { padding: 0; overflow: hidden; }
 .output {
