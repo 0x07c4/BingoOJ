@@ -255,6 +255,123 @@ select, .btn {
   grid-row: 1 / span 2;
   line-height: 1.68;
 }
+
+.statement-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.statement-language-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.statement-status {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px;
+  background: rgba(14, 14, 14, 0.55);
+}
+
+.statement-status-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.statement-status.error {
+  border-color: #614040;
+  color: #e7c0c0;
+}
+
+.statement-status-detail {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.statement-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.install-progress {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.install-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.install-phase {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-strong);
+}
+
+.install-step {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.install-progress-bar {
+  height: 8px;
+  margin-top: 10px;
+  border-radius: 999px;
+  background: #17191b;
+  overflow: hidden;
+}
+
+.install-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #5f8fcb, #8ab4f8);
+  transition: width 180ms ease;
+}
+
+.install-log {
+  margin-top: 12px;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: #0e0e0e;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.install-log > div + div {
+  margin-top: 4px;
+}
+
+.statement-inline-note {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid #5c4e35;
+  border-radius: 12px;
+  background: #18140d;
+  color: #dbc69d;
+  font-size: 12px;
+}
+
 .statement p,
 .statement li {
   color: var(--text-main);
@@ -270,6 +387,95 @@ select, .btn {
 .statement ul,
 .statement ol {
   margin-top: 0.9em;
+}
+
+.cf-statement {
+  color: var(--text-main);
+}
+
+.cf-statement .header {
+  margin-bottom: 20px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.cf-statement .title {
+  font-size: 24px;
+  font-weight: 760;
+  line-height: 1.25;
+  color: var(--text-strong);
+}
+
+.cf-statement .time-limit,
+.cf-statement .memory-limit,
+.cf-statement .input-file,
+.cf-statement .output-file {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.cf-statement .section-title,
+.cf-statement .input-specification .section-title,
+.cf-statement .output-specification .section-title,
+.cf-statement .note .section-title {
+  margin-top: 24px;
+  margin-bottom: 10px;
+  font-size: 17px;
+  font-weight: 760;
+  color: var(--text-strong);
+}
+
+.cf-statement p {
+  margin: 0;
+}
+
+.cf-statement p + p,
+.cf-statement ul,
+.cf-statement ol {
+  margin-top: 0.95em;
+}
+
+.cf-statement ul,
+.cf-statement ol {
+  padding-left: 1.4em;
+}
+
+.cf-statement li + li {
+  margin-top: 0.45em;
+}
+
+.cf-statement .sample-tests {
+  margin-top: 26px;
+}
+
+.cf-statement .sample-test {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.cf-statement .sample-test .input,
+.cf-statement .sample-test .output {
+  margin: 0;
+}
+
+.cf-statement .sample-test .title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.cf-statement pre {
+  margin-top: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cf-statement code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.95em;
 }
 .editor { padding: 0; overflow: hidden; }
 .output {

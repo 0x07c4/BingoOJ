@@ -9,6 +9,7 @@ console.log("BingoOJ App.jsx loaded v1");
 
 const PROBLEM_LIST_CACHE_KEY = "bingooj:cf:list:v1";
 const STATEMENT_CACHE_KEY = "bingooj:cf:statement:v1";
+const STATEMENT_TRANSLATION_CACHE_KEY = "bingooj:cf:translation:v3";
 const DRAFT_CACHE_KEY = "bingooj:drafts:v1";
 const PROBLEM_LIST_CACHE_MAX_AGE = 1000 * 60 * 30;
 const STATEMENT_CACHE_MAX_AGE = 1000 * 60 * 60 * 24 * 7;
@@ -150,6 +151,27 @@ function writeCachedStatement(problemId, value) {
   writeCache(STATEMENT_CACHE_KEY, cached);
 }
 
+function readCachedStatementTranslation(problemId, lang) {
+  const cached = readCache(STATEMENT_TRANSLATION_CACHE_KEY);
+  const entry = cached?.[problemId]?.[lang];
+  if (!entry?.savedAt || !entry?.value) return null;
+  if (Date.now() - entry.savedAt > STATEMENT_CACHE_MAX_AGE) return null;
+  return entry.value;
+}
+
+function writeCachedStatementTranslation(problemId, lang, value) {
+  const cached = readCache(STATEMENT_TRANSLATION_CACHE_KEY) ?? {};
+  const current = cached[problemId] ?? {};
+  cached[problemId] = {
+    ...current,
+    [lang]: {
+      savedAt: Date.now(),
+      value,
+    },
+  };
+  writeCache(STATEMENT_TRANSLATION_CACHE_KEY, cached);
+}
+
 function toComparableLines(text) {
   const normalized = String(text ?? "").replace(/\r\n/g, "\n");
   const trimmed = normalized.trimEnd();
@@ -192,6 +214,24 @@ export default function App() {
   const [err, setErr] = useState("");
   const [statementLoading, setStatementLoading] = useState(false);
   const [statementError, setStatementError] = useState("");
+  const [statementLanguage, setStatementLanguage] = useState("en");
+  const [translationLoading, setTranslationLoading] = useState(false);
+  const [translationError, setTranslationError] = useState("");
+  const [translationSupport, setTranslationSupport] = useState({
+    ready: false,
+    installing: false,
+    message: "Chinese statement support is not installed yet.",
+  });
+  const [translationInstall, setTranslationInstall] = useState({
+    active: false,
+    finished: false,
+    ready: false,
+    step: 0,
+    total_steps: 4,
+    phase: "Idle",
+    error: "",
+    logs: [],
+  });
   const [problemDrafts, setProblemDrafts] = useState(() => readDrafts());
   const [output, setOutput] = useState("Ready.");
   const [selectedSampleIndex, setSelectedSampleIndex] = useState(0);
@@ -260,10 +300,74 @@ export default function App() {
     selectedResult && !selectedResult.ok && !selectedResult.error
       ? buildLineDiff(selectedResult.expected, selectedResult.got)
       : null;
+  const translatedStatementHtml =
+    problem?.statementTranslations?.[statementLanguage] ?? null;
+  const displayedStatementHtml =
+    statementLanguage === "zh" ? translatedStatementHtml : problem?.statement_html;
+
+  async function refreshTranslationSupport() {
+    try {
+      const status = await invoke("get_translation_support_status", {
+        fromLang: "en",
+        toLang: "zh",
+      });
+      setTranslationSupport((current) => ({
+        ...current,
+        ready: Boolean(status?.ready),
+        installing: false,
+        message:
+          typeof status?.message === "string"
+            ? status.message
+            : "Chinese statement support is not installed yet.",
+      }));
+    } catch (e) {
+      setTranslationSupport((current) => ({
+        ...current,
+        ready: false,
+        installing: false,
+        message: String(e),
+      }));
+    }
+  }
 
   useEffect(() => {
     writeCache(DRAFT_CACHE_KEY, problemDrafts);
   }, [problemDrafts]);
+
+  useEffect(() => {
+    refreshTranslationSupport();
+  }, []);
+
+  useEffect(() => {
+    if (!translationInstall.active) return;
+
+    let alive = true;
+    const poll = async () => {
+      try {
+        const nextState = await invoke("get_translation_install_state");
+        if (!alive) return;
+        setTranslationInstall(nextState);
+        if (nextState.finished) {
+          await refreshTranslationSupport();
+        }
+      } catch (e) {
+        if (!alive) return;
+        setTranslationInstall((current) => ({
+          ...current,
+          active: false,
+          finished: true,
+          error: String(e),
+        }));
+      }
+    };
+
+    poll();
+    const timer = window.setInterval(poll, 800);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [translationInstall.active]);
 
   useEffect(() => {
     if (!problem?.contestId || !problem?.index || problem.statement_html) return;
@@ -348,7 +452,120 @@ export default function App() {
     setSampleResults([]);
     setOutput("Ready.");
     setWorkspaceMode("samples");
+    setStatementLanguage("en");
+    setTranslationLoading(false);
+    setTranslationError("");
+    setTranslationInstall({
+      active: false,
+      finished: false,
+      ready: false,
+      step: 0,
+      total_steps: 3,
+      phase: "Idle",
+      error: "",
+      logs: [],
+    });
   }, [problem?.id]);
+
+  useEffect(() => {
+    if (statementLanguage !== "zh") return;
+    if (!translationSupport.ready) return;
+    if (statementLanguage !== "zh" || !problem?.id || !problem?.statement_html) return;
+    if (problem.statementTranslations?.zh) return;
+
+    const cachedTranslation = readCachedStatementTranslation(problem.id, "zh");
+    if (cachedTranslation) {
+      setProblems((current) =>
+        current.map((item) =>
+          item.id === problem.id
+            ? {
+              ...item,
+              statementTranslations: {
+                ...(item.statementTranslations ?? {}),
+                zh: cachedTranslation,
+              },
+            }
+            : item
+        )
+      );
+      setTranslationError("");
+      return;
+    }
+
+    let alive = true;
+    (async () => {
+      try {
+        setTranslationLoading(true);
+        setTranslationError("");
+        const translatedHtml = await invoke("translate_problem_html", {
+          html: problem.statement_html,
+          fromLang: "en",
+          toLang: "zh",
+        });
+        if (!alive) return;
+
+        writeCachedStatementTranslation(problem.id, "zh", translatedHtml);
+        setProblems((current) =>
+          current.map((item) =>
+            item.id === problem.id
+              ? {
+                ...item,
+                statementTranslations: {
+                  ...(item.statementTranslations ?? {}),
+                  zh: translatedHtml,
+                },
+              }
+              : item
+          )
+        );
+      } catch (e) {
+        if (!alive) return;
+        setTranslationError(String(e));
+      } finally {
+        if (!alive) return;
+        setTranslationLoading(false);
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [
+    problem?.id,
+    problem?.statementTranslations,
+    problem?.statement_html,
+    statementLanguage,
+    translationSupport.ready,
+  ]);
+
+  async function installTranslationSupport() {
+    try {
+      setTranslationSupport((current) => ({
+        ...current,
+        installing: true,
+        message: "Installing Chinese statement support...",
+      }));
+      setTranslationError("");
+      const installState = await invoke("install_translation_support", {
+        fromLang: "en",
+        toLang: "zh",
+      });
+      setTranslationInstall(installState);
+    } catch (e) {
+      setTranslationSupport((current) => ({
+        ...current,
+        ready: false,
+        installing: false,
+        message: String(e),
+      }));
+      return;
+    }
+
+    setTranslationSupport((current) => ({
+      ...current,
+      installing: false,
+    }));
+  }
 
   function updateCurrentDraft(updater) {
     if (!problem?.id) return;
@@ -539,14 +756,114 @@ export default function App() {
 
         <section className="content">
           <div className="panel statement">
+            <div className="statement-toolbar">
+              <div>
+                <div className="section-title">Statement</div>
+                <div className="sample-subtitle">
+                  {statementLanguage === "zh" ? "中文(本地机翻)" : "English original"}
+                </div>
+              </div>
+              <div className="statement-language-toggle">
+                <button
+                  className={"workspace-tab " + (statementLanguage === "en" ? "active" : "")}
+                  onClick={() => setStatementLanguage("en")}
+                >
+                  English
+                </button>
+                <button
+                  className={"workspace-tab " + (statementLanguage === "zh" ? "active" : "")}
+                  onClick={() => setStatementLanguage("zh")}
+                >
+                  中文
+                </button>
+              </div>
+            </div>
             {statementLoading ? (
               <div>Loading statement...</div>
             ) : statementError ? (
               <div style={{ color: "salmon", whiteSpace: "pre-wrap" }}>{statementError}</div>
-            ) : problem?.statement_html ? (
-              <div className="cf-statement"
-                dangerouslySetInnerHTML={{ __html: problem.statement_html }}
-              />
+            ) : statementLanguage === "zh" && !translationSupport.ready ? (
+              <div className="statement-status">
+                <div className="statement-status-title">Chinese statement support is not ready.</div>
+                <div className="statement-status-detail">{translationSupport.message}</div>
+                {translationInstall.active || translationInstall.finished ? (
+                  <div className="install-progress">
+                    <div className="install-progress-head">
+                      <div className="install-phase">{translationInstall.phase}</div>
+                      <div className="install-step">
+                        Step {Math.min(
+                          Math.max(translationInstall.step, translationInstall.active ? 1 : 0),
+                          translationInstall.total_steps
+                        )}
+                        /{translationInstall.total_steps}
+                      </div>
+                    </div>
+                    <div className="install-progress-bar">
+                      <div
+                        className="install-progress-fill"
+                        style={{
+                          width: `${Math.max(
+                            8,
+                            (Math.max(
+                              translationInstall.step,
+                              translationInstall.finished ? translationInstall.total_steps : 0
+                            ) /
+                              Math.max(translationInstall.total_steps, 1)) *
+                              100
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                    {translationInstall.logs?.length ? (
+                      <div className="install-log">
+                        {translationInstall.logs.map((line, index) => (
+                          <div key={`install-log-${index}`}>{line}</div>
+                        ))}
+                      </div>
+                    ) : null}
+                    {translationInstall.error ? (
+                      <div className="statement-status-detail">{translationInstall.error}</div>
+                    ) : null}
+                  </div>
+                ) : null}
+                <div className="statement-actions">
+                  <button
+                    className="btn primary"
+                    onClick={installTranslationSupport}
+                    disabled={translationSupport.installing || translationInstall.active}
+                  >
+                    {translationInstall.active || translationSupport.installing
+                      ? "Installing..."
+                      : "Set Up Chinese Statement Support"}
+                  </button>
+                  <button className="btn subtle" onClick={() => setStatementLanguage("en")}>
+                    Use English Instead
+                  </button>
+                </div>
+              </div>
+            ) : statementLanguage === "zh" && translationLoading && !displayedStatementHtml ? (
+              <div className="statement-status">Translating statement locally...</div>
+            ) : statementLanguage === "zh" && translationError && !displayedStatementHtml ? (
+              <div className="statement-status error">
+                <div className="statement-status-title">Local translation failed.</div>
+                <div className="statement-status-detail">{translationError}</div>
+                <div className="statement-actions">
+                  <button className="btn subtle" onClick={() => setStatementLanguage("en")}>
+                    Back to English
+                  </button>
+                </div>
+              </div>
+            ) : displayedStatementHtml ? (
+              <>
+                {statementLanguage === "zh" && translationError ? (
+                  <div className="statement-inline-note">
+                    Local translation warning: {translationError}
+                  </div>
+                ) : null}
+                <div className="cf-statement"
+                  dangerouslySetInnerHTML={{ __html: displayedStatementHtml }}
+                />
+              </>
             ) : (
               <ReactMarkdown>{problem?.statementMd ?? ""}</ReactMarkdown>
             )}
