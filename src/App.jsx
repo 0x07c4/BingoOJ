@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cfListProblems } from "./oj/codeforces";
 import ReactMarkdown from "react-markdown";
@@ -9,6 +9,7 @@ console.log("BingoOJ App.jsx loaded v1");
 
 const PROBLEM_LIST_CACHE_KEY = "bingooj:cf:list:v1";
 const STATEMENT_CACHE_KEY = "bingooj:cf:statement:v1";
+const DRAFT_CACHE_KEY = "bingooj:drafts:v1";
 const PROBLEM_LIST_CACHE_MAX_AGE = 1000 * 60 * 30;
 const STATEMENT_CACHE_MAX_AGE = 1000 * 60 * 60 * 24 * 7;
 
@@ -61,6 +62,53 @@ solve(input);
   },
 };
 
+function createLanguageDrafts() {
+  return Object.fromEntries(
+    Object.entries(LANGUAGES).map(([key, config]) => [key, config.template])
+  );
+}
+
+function createProblemDraft(stdin = "") {
+  return {
+    lang: "cpp",
+    drafts: createLanguageDrafts(),
+    stdin,
+    hasEditedStdin: false,
+  };
+}
+
+function normalizeProblemDraft(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const lang = value.lang in LANGUAGES ? value.lang : "cpp";
+  const rawDrafts = value.drafts && typeof value.drafts === "object" ? value.drafts : {};
+
+  return {
+    lang,
+    drafts: Object.fromEntries(
+      Object.entries(LANGUAGES).map(([key, config]) => [
+        key,
+        typeof rawDrafts[key] === "string" ? rawDrafts[key] : config.template,
+      ])
+    ),
+    stdin: typeof value.stdin === "string" ? value.stdin : "",
+    hasEditedStdin: Boolean(value.hasEditedStdin),
+  };
+}
+
+function readDrafts() {
+  const cached = readCache(DRAFT_CACHE_KEY);
+  if (!cached || typeof cached !== "object") return {};
+
+  return Object.fromEntries(
+    Object.entries(cached)
+      .map(([problemId, value]) => [problemId, normalizeProblemDraft(value)])
+      .filter(([, value]) => value !== null)
+  );
+}
+
 function readCache(key) {
   try {
     const raw = localStorage.getItem(key);
@@ -102,6 +150,41 @@ function writeCachedStatement(problemId, value) {
   writeCache(STATEMENT_CACHE_KEY, cached);
 }
 
+function toComparableLines(text) {
+  const normalized = String(text ?? "").replace(/\r\n/g, "\n");
+  const trimmed = normalized.trimEnd();
+  if (!trimmed) return [];
+  return trimmed.split("\n");
+}
+
+function buildLineDiff(expected, got) {
+  const expectedLines = toComparableLines(expected);
+  const gotLines = toComparableLines(got);
+  const rowCount = Math.max(expectedLines.length, gotLines.length);
+  const rows = [];
+  let firstMismatchLine = null;
+
+  for (let i = 0; i < rowCount; i++) {
+    const expectedLine = expectedLines[i] ?? "";
+    const gotLine = gotLines[i] ?? "";
+    const matches = expectedLine === gotLine;
+    if (!matches && firstMismatchLine === null) {
+      firstMismatchLine = i + 1;
+    }
+    rows.push({
+      lineNumber: i + 1,
+      expected: expectedLine,
+      got: gotLine,
+      matches,
+    });
+  }
+
+  return {
+    rows,
+    firstMismatchLine,
+  };
+}
+
 export default function App() {
   const [selectedId, setSelectedId] = useState("");
   const [problems, setProblems] = useState([]);
@@ -109,18 +192,11 @@ export default function App() {
   const [err, setErr] = useState("");
   const [statementLoading, setStatementLoading] = useState(false);
   const [statementError, setStatementError] = useState("");
-
-  const [lang, setLang] = useState("cpp");
-  const [drafts, setDrafts] = useState(() =>
-    Object.fromEntries(
-      Object.entries(LANGUAGES).map(([key, config]) => [key, config.template])
-    )
-  );
-  const [stdin, setStdin] = useState("8\n");
+  const [problemDrafts, setProblemDrafts] = useState(() => readDrafts());
   const [output, setOutput] = useState("Ready.");
-  const [seededProblemId, setSeededProblemId] = useState("");
   const [selectedSampleIndex, setSelectedSampleIndex] = useState(0);
   const [sampleResults, setSampleResults] = useState([]);
+  const [workspaceMode, setWorkspaceMode] = useState("samples");
 
   useEffect(() => {
     const cachedProblems = readFreshValue(
@@ -170,13 +246,24 @@ export default function App() {
     () => problems.find((p) => p.id === selectedId),
     [problems, selectedId]
   );
+  const currentDraft = problem?.id ? problemDrafts[problem.id] ?? null : null;
+  const lang = currentDraft?.lang ?? "cpp";
   const currentLanguage = LANGUAGES[lang];
-  const code = drafts[lang] ?? currentLanguage.template;
+  const code = currentDraft?.drafts?.[lang] ?? currentLanguage.template;
+  const stdin = currentDraft?.stdin ?? "";
   const samples = problem?.samples ?? [];
   const selectedSample = samples[selectedSampleIndex] ?? null;
   const selectedResult =
     sampleResults.find((result) => result.index === selectedSampleIndex) ?? null;
   const passedSamples = sampleResults.filter((result) => result.ok).length;
+  const selectedDiff =
+    selectedResult && !selectedResult.ok && !selectedResult.error
+      ? buildLineDiff(selectedResult.expected, selectedResult.got)
+      : null;
+
+  useEffect(() => {
+    writeCache(DRAFT_CACHE_KEY, problemDrafts);
+  }, [problemDrafts]);
 
   useEffect(() => {
     if (!problem?.contestId || !problem?.index || problem.statement_html) return;
@@ -232,21 +319,58 @@ export default function App() {
   }, [problem?.contestId, problem?.id, problem?.index, problem?.statement_html]);
 
   useEffect(() => {
-    if (!problem?.id || seededProblemId === problem.id) return;
+    if (!problem?.id) return;
 
-    const sampleInput = problem.samples?.[0]?.input;
-    if (!sampleInput) return;
+    const sampleInput = problem.samples?.[0]?.input ?? "";
+    setProblemDrafts((current) => {
+      const existing = current[problem.id];
+      if (!existing) {
+        return {
+          ...current,
+          [problem.id]: createProblemDraft(sampleInput),
+        };
+      }
+      if (!existing.hasEditedStdin && !existing.stdin && sampleInput) {
+        return {
+          ...current,
+          [problem.id]: {
+            ...existing,
+            stdin: sampleInput,
+          },
+        };
+      }
+      return current;
+    });
+  }, [problem?.id, problem?.samples]);
 
-    setStdin(sampleInput);
+  useEffect(() => {
     setSelectedSampleIndex(0);
     setSampleResults([]);
-    setSeededProblemId(problem.id);
-  }, [problem?.id, problem?.samples, seededProblemId]);
+    setOutput("Ready.");
+    setWorkspaceMode("samples");
+  }, [problem?.id]);
+
+  function updateCurrentDraft(updater) {
+    if (!problem?.id) return;
+
+    setProblemDrafts((current) => {
+      const existing =
+        current[problem.id] ??
+        createProblemDraft(problem.samples?.[0]?.input ?? "");
+      return {
+        ...current,
+        [problem.id]: updater(existing),
+      };
+    });
+  }
 
   function updateCode(nextCode) {
-    setDrafts((current) => ({
+    updateCurrentDraft((current) => ({
       ...current,
-      [lang]: nextCode,
+      drafts: {
+        ...current.drafts,
+        [lang]: nextCode,
+      },
     }));
   }
 
@@ -261,15 +385,18 @@ export default function App() {
   async function runOnce() {
     try {
       setSampleResults([]);
+      setWorkspaceMode("custom");
       setOutput(`Running ${currentLanguage.label}...`);
       const out = await executeCode(stdin);
       setOutput(String(out));
     } catch (e) {
+      setWorkspaceMode("custom");
       setOutput(String(e));
     }
   }
 
   async function runSamples() {
+    setWorkspaceMode("samples");
     setOutput(`Running ${currentLanguage.label} samples...`);
 
     if (samples.length === 0) {
@@ -317,18 +444,30 @@ export default function App() {
   function loadSampleToStdin(index) {
     const sample = samples[index];
     if (!sample) return;
+    setWorkspaceMode("samples");
     setSelectedSampleIndex(index);
-    setStdin(sample.input);
+    updateCurrentDraft((current) => ({
+      ...current,
+      stdin: sample.input,
+      hasEditedStdin: true,
+    }));
   }
 
   return (
     <div className="layout">
       <aside className="sidebar">
-        <div className="brand">BingoOJ</div>
+        <div className="sidebar-head">
+          <div className="brand">BingoOJ</div>
+          <div className="sidebar-subtitle">Codeforces Problemset</div>
+        </div>
 
         {loading && <div style={{ opacity: 0.7 }}>Loading Codeforces</div>}
         {err && (<div style={{ color: "salmon", whiteSpace: "pre-wrap" }}>{err}</div>)}
 
+        <div className="list-head">
+          <div className="list-title">Problems</div>
+          <div className="list-count">{problems.length}</div>
+        </div>
         <div className="list">
           {problems.map((p) => (
             <button
@@ -337,10 +476,13 @@ export default function App() {
               onClick={() => setSelectedId(p.id)}
               title={p.id}
             >
-              <div className="title">{p.title}</div>
+              <div className="item-row">
+                <div className="title">{p.title}</div>
+                <div className="item-id">{p.index}</div>
+              </div>
               <div className="meta">
-                {p.source} · {p.id}
-                {p.rating ? ` . ${p.rating}` : ""}
+                <span>{p.id}</span>
+                {p.rating ? <span>{p.rating}</span> : null}
               </div>
             </button>
           ))}
@@ -357,21 +499,41 @@ export default function App() {
           </div>
 
           <div className="controls">
-            <select value={lang} onChange={(e) => setLang(e.target.value)}>
-              <option value="cpp">C++</option>
-              <option value="py">Python</option>
-              <option value="js">JavaScript</option>
-            </select>
-            <button className="btn" onClick={runOnce}
-            >
-              Run
-            </button>
-            <button className="btn primary" onClick={() => setOutput("Submit (todo)")}>
-              Submit
-            </button>
-            <button className="btn" onClick={runSamples}>
-              Run Samples
-            </button>
+            <div className="control-group">
+              <div className="control-label">Language</div>
+              <select
+                value={lang}
+                onChange={(e) => {
+                  const nextLang = e.target.value;
+                  updateCurrentDraft((current) => ({
+                    ...current,
+                    lang: nextLang,
+                  }));
+                }}
+              >
+                <option value="cpp">C++</option>
+                <option value="py">Python</option>
+                <option value="js">JavaScript</option>
+              </select>
+            </div>
+            <div className="control-group actions">
+              <div className="control-label">Actions</div>
+              <div className="action-row">
+                <button className="btn primary" onClick={runOnce}>
+                  Run
+                </button>
+                <button
+                  className="btn core"
+                  disabled
+                  title="Submit will be implemented next."
+                >
+                  Submit
+                </button>
+                <button className="btn subtle" onClick={runSamples}>
+                  Run Samples
+                </button>
+              </div>
+            </div>
           </div>
         </header>
 
@@ -410,89 +572,159 @@ export default function App() {
           </div>
 
           <div className="panel output">
-            <div className="sample-panel">
-              <div className="sample-header">
-                <div>
-                  <div className="section-title">Samples</div>
-                  <div className="sample-subtitle">
-                    {sampleResults.length > 0
-                      ? `${passedSamples} / ${sampleResults.length} passed`
-                      : `${samples.length} cases`}
+            <div className="workspace-tabs">
+              <button
+                className={"workspace-tab " + (workspaceMode === "samples" ? "active" : "")}
+                onClick={() => setWorkspaceMode("samples")}
+              >
+                Samples
+              </button>
+              <button
+                className={"workspace-tab " + (workspaceMode === "custom" ? "active" : "")}
+                onClick={() => setWorkspaceMode("custom")}
+              >
+                Custom Test
+              </button>
+            </div>
+
+            {workspaceMode === "samples" ? (
+              <div className="sample-panel">
+                <div className="sample-header">
+                  <div>
+                    <div className="section-title">Samples</div>
+                    <div className="sample-subtitle">
+                      {sampleResults.length > 0
+                        ? `${passedSamples} / ${sampleResults.length} passed`
+                        : `${samples.length} cases`}
+                    </div>
                   </div>
+                  {selectedResult ? (
+                    <div className={"sample-inline-status " + (selectedResult.ok ? "pass" : "fail")}>
+                      <span className="status-dot" />
+                      <span>{selectedResult.ok ? "Passed" : "Failed"}</span>
+                    </div>
+                  ) : null}
                 </div>
-                {selectedResult ? (
-                  <div className={"sample-inline-status " + (selectedResult.ok ? "pass" : "fail")}>
-                    <span className="status-dot" />
-                    <span>{selectedResult.ok ? "Passed" : "Failed"}</span>
+                {samples.length > 1 ? (
+                  <div className="sample-tabs">
+                    {samples.map((sample, index) => {
+                      const result = sampleResults.find((item) => item.index === index);
+                      return (
+                        <button
+                          key={`${problem?.id}-sample-${index}`}
+                          className={"sample-tab " + (index === selectedSampleIndex ? "active" : "")}
+                          onClick={() => loadSampleToStdin(index)}
+                        >
+                          <span className="sample-tab-title">Sample {index + 1}</span>
+                          {result ? (
+                            <span className={"sample-status " + (result.ok ? "pass" : "fail")}>
+                              {result.ok ? "AC" : "WA"}
+                            </span>
+                          ) : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+                {selectedSample ? (
+                  <div className="sample-meta">
+                    <div className="sample-title">Sample {selectedSampleIndex + 1}</div>
+                  </div>
+                ) : null}
+                {selectedSample ? (
+                  <div className="sample-detail sample-detail-triple">
+                    <div>
+                      <div className="label">Input</div>
+                      <pre>{selectedSample.input}</pre>
+                    </div>
+                    <div>
+                      <div className="label">Expected Output</div>
+                      <pre>{selectedSample.output}</pre>
+                    </div>
+                    <div>
+                      <div className="label">{selectedResult?.error ? "Runtime Error" : "Got"}</div>
+                      <pre>{selectedResult ? selectedResult.error || selectedResult.got : "Run Samples to evaluate this case."}</pre>
+                    </div>
+                  </div>
+                ) : null}
+                {selectedDiff ? (
+                  <div className="diff-panel">
+                    <div className="diff-summary">
+                      First difference at line {selectedDiff.firstMismatchLine}.
+                    </div>
+                    <div className="diff-table">
+                      <div className="diff-table-head">Expected</div>
+                      <div className="diff-table-head">Got</div>
+                      {selectedDiff.rows.map((row) => (
+                        <Fragment key={`diff-row-${row.lineNumber}`}>
+                          <div
+                            className={"diff-cell " + (row.matches ? "" : "mismatch")}
+                          >
+                            <span className="diff-line-number">{row.lineNumber}</span>
+                            <span className="diff-line-text">{row.expected || " "}</span>
+                          </div>
+                          <div
+                            className={"diff-cell " + (row.matches ? "" : "mismatch")}
+                          >
+                            <span className="diff-line-number">{row.lineNumber}</span>
+                            <span className="diff-line-text">{row.got || " "}</span>
+                          </div>
+                        </Fragment>
+                      ))}
+                    </div>
+                  </div>
+                ) : !selectedResult ? (
+                  <div className="sample-empty-state">
+                    <div className="sample-empty-title">Run Samples to compare this case.</div>
+                    <div className="sample-empty-body">
+                      You will see the actual output and the first mismatch here.
+                    </div>
                   </div>
                 ) : null}
               </div>
-              {samples.length > 1 ? (
-                <div className="sample-tabs">
-                  {samples.map((sample, index) => {
-                    const result = sampleResults.find((item) => item.index === index);
-                    return (
-                      <button
-                        key={`${problem?.id}-sample-${index}`}
-                        className={"sample-tab " + (index === selectedSampleIndex ? "active" : "")}
-                        onClick={() => loadSampleToStdin(index)}
-                      >
-                        <span className="sample-tab-title">Sample {index + 1}</span>
-                        {result ? (
-                          <span className={"sample-status " + (result.ok ? "pass" : "fail")}>
-                            {result.ok ? "AC" : "WA"}
-                          </span>
-                        ) : null}
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : null}
-              {selectedSample ? (
-                <div className="sample-meta">
-                  <div className="sample-title">Sample {selectedSampleIndex + 1}</div>
-                </div>
-              ) : null}
-              {selectedSample ? (
-                <div className="sample-detail">
+            ) : (
+              <div className="custom-panel">
+                <div className="custom-header">
                   <div>
-                    <div className="label">Sample Input</div>
-                    <pre>{selectedSample.input}</pre>
-                  </div>
-                  <div>
-                    <div className="label">Sample Output</div>
-                    <pre>{selectedSample.output}</pre>
+                    <div className="section-title">Custom Test</div>
+                    <div className="sample-subtitle">Edit input here, then use Run.</div>
                   </div>
                 </div>
-              ) : null}
-              {selectedResult ? (
-                <div>
-                  <div className="label">{selectedResult.error ? "Runtime Error" : "Your Output"}</div>
-                  <pre>{selectedResult.error || selectedResult.got}</pre>
+                <div className="custom-sections">
+                  <div className="io-section">
+                    <div className="io-header">
+                      <div className="label">Input</div>
+                    </div>
+                    <textarea
+                      value={stdin}
+                      onChange={(e) => {
+                        const nextStdin = e.target.value;
+                        updateCurrentDraft((current) => ({
+                          ...current,
+                          stdin: nextStdin,
+                          hasEditedStdin: true,
+                        }));
+                      }}
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        borderRadius: 12,
+                        border: "1px solid #232323",
+                        background: "#0e0e0e",
+                        color: "inherit",
+                        padding: 10,
+                      }}
+                    />
+                  </div>
+                  <div className="io-section">
+                    <div className="io-header">
+                      <div className="label">Output</div>
+                    </div>
+                    <pre className="out">{output}</pre>
+                  </div>
                 </div>
-              ) : null}
-            </div>
-
-            <div className="io-section">
-              <div className="label">Stdin</div>
-              <textarea
-                value={stdin}
-                onChange={(e) => setStdin(e.target.value)}
-                style={{
-                  width: "100%",
-                  height: "100%",
-                  borderRadius: 12,
-                  border: "1px solid #232323",
-                  background: "#0e0e0e",
-                  color: "inherit",
-                  padding: 10,
-                }}
-              />
-            </div>
-            <div className="io-section">
-              <div className="label">Output</div>
-              <pre className="out">{output}</pre>
-            </div>
+              </div>
+            )}
           </div>
         </section>
       </main>
