@@ -4,7 +4,7 @@ use flate2::read::GzDecoder;
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::Client;
 use scraper::{ElementRef, Html, Node, Selector};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     env,
     fs::{self, File},
@@ -16,9 +16,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tar::Archive;
+use tauri::{
+    webview::{Cookie, PageLoadEvent},
+    Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+};
 
 static TRANSLATION_INSTALL_STATE: LazyLock<Mutex<TranslationInstallState>> =
     LazyLock::new(|| Mutex::new(TranslationInstallState::idle()));
+static CODEFORCES_AUTH_STATE: LazyLock<Mutex<CodeforcesAuthState>> =
+    LazyLock::new(|| Mutex::new(CodeforcesAuthState::signed_out()));
 
 #[derive(Clone, Serialize)]
 struct TranslationInstallState {
@@ -47,6 +53,67 @@ impl TranslationInstallState {
     }
 }
 
+#[derive(Clone, Serialize)]
+struct CodeforcesAuthState {
+    connected: bool,
+    checking: bool,
+    expired: bool,
+    handle: Option<String>,
+    last_url: Option<String>,
+    message: String,
+}
+
+impl CodeforcesAuthState {
+    fn signed_out() -> Self {
+        Self {
+            connected: false,
+            checking: false,
+            expired: false,
+            handle: None,
+            last_url: None,
+            message: "提交前请先登录".to_string(),
+        }
+    }
+
+    fn expired() -> Self {
+        Self {
+            connected: false,
+            checking: false,
+            expired: true,
+            handle: None,
+            last_url: None,
+            message: "Codeforces 登录已过期，请重新登录".to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CodeforcesSubmissionStatus {
+    found: bool,
+    id: Option<u64>,
+    verdict: Option<String>,
+    passed_test_count: Option<u64>,
+    programming_language: Option<String>,
+    status_text: String,
+    finished: bool,
+    debug: Option<String>,
+}
+
+#[derive(Default)]
+struct WebviewSubmitState {
+    form_submitted: bool,
+    inspect_requested: bool,
+}
+
+struct SubmitFormPage {
+    csrf_token: String,
+    hidden_fields: Vec<(String, String)>,
+    language_options: Vec<(String, String)>,
+    ftaa: Option<String>,
+    bfaa: Option<String>,
+    tta: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 struct LatestReleaseMetadata {
     tag: String,
@@ -61,6 +128,16 @@ struct GitHubRelease {
 struct GitHubReleaseAsset {
     name: String,
     browser_download_url: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredCodeforcesCookie {
+    name: String,
+    value: String,
+    domain: Option<String>,
+    path: Option<String>,
+    secure: Option<bool>,
+    http_only: Option<bool>,
 }
 
 fn with_install_state<R>(f: impl FnOnce(&mut TranslationInstallState) -> R) -> R {
@@ -122,6 +199,285 @@ fn finish_install_error(message: String) {
     });
 }
 
+fn with_codeforces_auth_state<R>(f: impl FnOnce(&mut CodeforcesAuthState) -> R) -> R {
+    let mut state = CODEFORCES_AUTH_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut state)
+}
+
+fn current_codeforces_auth_state() -> CodeforcesAuthState {
+    with_codeforces_auth_state(|state| state.clone())
+}
+
+fn emit_codeforces_auth_state(app: &tauri::AppHandle, state: &CodeforcesAuthState) {
+    let _ = app.emit("cf-auth-status", state);
+}
+
+fn set_codeforces_auth_state(app: &tauri::AppHandle, state: CodeforcesAuthState) {
+    with_codeforces_auth_state(|current| {
+        *current = state.clone();
+    });
+    emit_codeforces_auth_state(app, &state);
+}
+
+fn codeforces_cookie_header(window: &WebviewWindow) -> Result<Option<String>, String> {
+    let url = "https://codeforces.com/"
+        .parse()
+        .map_err(|err| format!("parse Codeforces cookie url failed: {err}"))?;
+    let cookies = window
+        .cookies_for_url(url)
+        .map_err(|err| format!("read Codeforces cookies failed: {err}"))?;
+
+    let header = cookies
+        .into_iter()
+        .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if header.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(header))
+    }
+}
+
+fn codeforces_cookie_store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("resolve app data dir failed: {err}"))?;
+    fs::create_dir_all(&dir).map_err(|err| format!("create app data dir failed: {err}"))?;
+    Ok(dir.join("codeforces-cookies.json"))
+}
+
+fn snapshot_codeforces_cookies(window: &WebviewWindow) -> Result<Vec<StoredCodeforcesCookie>, String> {
+    let url = "https://codeforces.com/"
+        .parse()
+        .map_err(|err| format!("parse Codeforces cookie url failed: {err}"))?;
+    let cookies = window
+        .cookies_for_url(url)
+        .map_err(|err| format!("read Codeforces cookies failed: {err}"))?;
+
+    Ok(cookies
+        .into_iter()
+        .filter(should_persist_codeforces_cookie)
+        .map(|cookie| StoredCodeforcesCookie {
+            name: cookie.name().to_string(),
+            value: cookie.value().to_string(),
+            domain: cookie.domain().map(|value| value.to_string()),
+            path: cookie.path().map(|value| value.to_string()),
+            secure: cookie.secure(),
+            http_only: cookie.http_only(),
+        })
+        .collect())
+}
+
+fn should_persist_codeforces_cookie(cookie: &Cookie<'_>) -> bool {
+    let name = cookie.name();
+    if cookie.value().is_empty() {
+        return false;
+    }
+
+    !matches!(
+        name,
+        "_ga"
+            | "_gid"
+            | "_gat"
+            | "_ym_d"
+            | "_ym_isad"
+            | "_ym_uid"
+            | "__utma"
+            | "__utmb"
+            | "__utmc"
+            | "__utmz"
+    )
+}
+
+fn save_codeforces_cookies(app: &tauri::AppHandle, window: &WebviewWindow) -> Result<(), String> {
+    let cookies = snapshot_codeforces_cookies(window)?;
+    let path = codeforces_cookie_store_path(app)?;
+    let json = serde_json::to_vec_pretty(&cookies)
+        .map_err(|err| format!("serialize Codeforces cookies failed: {err}"))?;
+    fs::write(&path, json).map_err(|err| format!("write Codeforces cookies failed: {err}"))?;
+    Ok(())
+}
+
+fn clear_saved_codeforces_cookies(app: &tauri::AppHandle) -> Result<(), String> {
+    let path = codeforces_cookie_store_path(app)?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|err| format!("remove saved Codeforces cookies failed: {err}"))?;
+    }
+    Ok(())
+}
+
+fn restore_codeforces_cookies(app: &tauri::AppHandle, window: &WebviewWindow) -> Result<bool, String> {
+    let path = codeforces_cookie_store_path(app)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let json = fs::read(&path).map_err(|err| format!("read saved Codeforces cookies failed: {err}"))?;
+    let cookies: Vec<StoredCodeforcesCookie> = serde_json::from_slice(&json)
+        .map_err(|err| format!("parse saved Codeforces cookies failed: {err}"))?;
+
+    for stored in cookies {
+        let mut cookie = Cookie::new(stored.name, stored.value);
+        if let Some(domain) = stored.domain {
+            cookie.set_domain(domain);
+        }
+        if let Some(path) = stored.path {
+            cookie.set_path(path);
+        }
+        if let Some(secure) = stored.secure {
+            cookie.set_secure(secure);
+        }
+        if let Some(http_only) = stored.http_only {
+            cookie.set_http_only(http_only);
+        }
+        window
+            .set_cookie(cookie)
+            .map_err(|err| format!("restore Codeforces cookie failed: {err}"))?;
+    }
+
+    Ok(true)
+}
+
+fn clear_codeforces_cookies_for_window(window: &WebviewWindow) -> Result<(), String> {
+    let url = "https://codeforces.com/"
+        .parse()
+        .map_err(|err| format!("parse Codeforces cookie url failed: {err}"))?;
+    let cookies = window
+        .cookies_for_url(url)
+        .map_err(|err| format!("read Codeforces cookies failed: {err}"))?;
+
+    for cookie in cookies {
+        window
+            .delete_cookie(cookie)
+            .map_err(|err| format!("delete Codeforces cookie failed: {err}"))?;
+    }
+
+    Ok(())
+}
+
+fn parse_codeforces_handle(body: &str) -> Option<String> {
+    let document = Html::parse_document(body);
+    let selector = Selector::parse("a[href^='/profile/']").ok()?;
+
+    document.select(&selector).find_map(|node| {
+        let text = node.text().collect::<String>().trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    })
+}
+
+fn verify_codeforces_auth(window: &WebviewWindow) -> Result<CodeforcesAuthState, String> {
+    let Some(cookie_header) = codeforces_cookie_header(window)? else {
+        return Ok(CodeforcesAuthState::signed_out());
+    };
+
+    let client = BlockingClient::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 BingoOJ/0.1")
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|err| format!("build Codeforces auth client failed: {err}"))?;
+
+    let response = client
+        .get("https://codeforces.com/settings/general")
+        .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::PRAGMA, "no-cache")
+        .header(reqwest::header::REFERER, "https://codeforces.com/")
+        .header(reqwest::header::COOKIE, cookie_header)
+        .send()
+        .map_err(|err| format!("verify Codeforces login failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("Codeforces login verification returned an error: {err}"))?;
+
+    let final_url = response.url().to_string();
+    let body = response
+        .text()
+        .map_err(|err| format!("read Codeforces login verification response failed: {err}"))?;
+
+    if final_url.contains("/enter") {
+        let mut status = CodeforcesAuthState::expired();
+        status.last_url = Some(final_url);
+        return Ok(status);
+    }
+
+    let handle = parse_codeforces_handle(&body);
+    let message = handle
+        .as_ref()
+        .map(|handle| format!("已登录：{handle}"))
+        .unwrap_or_else(|| "已登录，可以提交代码".to_string());
+
+    Ok(CodeforcesAuthState {
+        connected: true,
+        checking: false,
+        expired: false,
+        handle,
+        last_url: Some(final_url),
+        message,
+    })
+}
+
+fn auth_webview_for_check(app: &tauri::AppHandle) -> Option<WebviewWindow> {
+    app.get_webview_window("codeforces-auth")
+        .or_else(|| app.get_webview_window("main"))
+}
+
+fn refresh_codeforces_auth_state(app: &tauri::AppHandle) -> Result<CodeforcesAuthState, String> {
+    let window = auth_webview_for_check(app)
+        .ok_or("no webview is available to read Codeforces cookies".to_string())?;
+    let status = verify_codeforces_auth(&window)?;
+    if status.connected {
+        let _ = save_codeforces_cookies(app, &window);
+    } else {
+        let _ = clear_saved_codeforces_cookies(app);
+    }
+    set_codeforces_auth_state(app, status.clone());
+    Ok(status)
+}
+
+fn schedule_codeforces_auth_refresh(app: tauri::AppHandle) {
+    let mut checking_state = current_codeforces_auth_state();
+    checking_state.checking = true;
+    if checking_state.message.is_empty() {
+        checking_state.message = "正在检查登录状态...".to_string();
+    }
+    set_codeforces_auth_state(&app, checking_state);
+
+    thread::spawn(move || {
+        match refresh_codeforces_auth_state(&app) {
+            Ok(status) => {
+                if status.connected {
+                    if let Some(window) = app.get_webview_window("codeforces-auth") {
+                        let _ = window.close();
+                    }
+                }
+            }
+            Err(err) => {
+                let current = current_codeforces_auth_state();
+                let status = CodeforcesAuthState {
+                    connected: false,
+                    checking: false,
+                    expired: false,
+                    handle: None,
+                    last_url: current.last_url,
+                    message: err,
+                };
+                set_codeforces_auth_state(&app, status);
+            }
+        }
+    });
+}
+
 #[tauri::command]
 async fn run_code(lang: String, code: String, stdin: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -134,6 +490,453 @@ async fn run_code(lang: String, code: String, stdin: String) -> Result<String, S
     })
     .await
     .map_err(|e| format!("run_code task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn cf_open_auth_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("codeforces-auth") {
+        window
+            .show()
+            .map_err(|err| format!("show Codeforces login window failed: {err}"))?;
+        window
+            .set_focus()
+            .map_err(|err| format!("focus Codeforces login window failed: {err}"))?;
+        schedule_codeforces_auth_refresh(app);
+        return Ok(());
+    }
+
+    let app_handle = app.clone();
+    WebviewWindowBuilder::new(
+        &app,
+        "codeforces-auth",
+        WebviewUrl::External(
+            "https://codeforces.com/enter"
+                .parse()
+                .map_err(|err| format!("invalid Codeforces login url: {err}"))?,
+        ),
+    )
+    .title("Codeforces 登录")
+    .inner_size(1080.0, 820.0)
+    .resizable(true)
+    .center()
+    .on_navigation(move |url| {
+        with_codeforces_auth_state(|state| {
+            state.last_url = Some(url.as_str().to_string());
+        });
+        emit_codeforces_auth_state(&app_handle, &current_codeforces_auth_state());
+        if url.host_str() == Some("codeforces.com") {
+            schedule_codeforces_auth_refresh(app_handle.clone());
+        }
+        true
+    })
+    .build()
+    .map_err(|err| format!("open Codeforces login window failed: {err}"))?;
+
+    schedule_codeforces_auth_refresh(app);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cf_get_auth_status(app: tauri::AppHandle) -> Result<CodeforcesAuthState, String> {
+    tauri::async_runtime::spawn_blocking(move || refresh_codeforces_auth_state(&app))
+        .await
+        .map_err(|err| format!("Codeforces auth status task failed: {err}"))?
+}
+
+#[tauri::command]
+async fn cf_logout(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        for label in ["main", "codeforces-auth", "codeforces-submit"] {
+            if let Some(window) = app.get_webview_window(label) {
+                let _ = clear_codeforces_cookies_for_window(&window);
+                if label != "main" {
+                    let _ = window.close();
+                }
+            }
+        }
+
+        clear_saved_codeforces_cookies(&app)?;
+        set_codeforces_auth_state(&app, CodeforcesAuthState::signed_out());
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|err| format!("Codeforces logout task failed: {err}"))?
+}
+
+#[tauri::command]
+async fn cf_submit_solution(
+    app: tauri::AppHandle,
+    contest_id: u32,
+    index: String,
+    lang: String,
+    code: String,
+) -> Result<serde_json::Value, String> {
+    let state = current_codeforces_auth_state();
+    if !state.connected {
+        return Err("Codeforces account is not connected yet.".to_string());
+    }
+
+    let problem_code = format!("{contest_id}{index}");
+    let submit_page_url = format!(
+        "https://codeforces.com/problemset/submit?contestId={contest_id}&problemIndex={index}"
+    );
+    if let Some(window) = app.get_webview_window("codeforces-submit") {
+        let _ = window.close();
+    }
+
+    let state = std::sync::Arc::new(Mutex::new(WebviewSubmitState::default()));
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<u64, String>>(1);
+    let sender = std::sync::Arc::new(Mutex::new(Some(tx)));
+
+    let submit_state = state.clone();
+    let submit_sender = sender.clone();
+    let title_sender = sender.clone();
+
+    let submit_script = build_codeforces_submit_script(&lang, &problem_code, &index, &code)
+        .map_err(|err| format!("serialize Codeforces submit script failed: {err}"))?;
+    let inspect_script = build_codeforces_submit_inspect_script();
+
+    let window = WebviewWindowBuilder::new(
+        &app,
+        "codeforces-submit",
+        WebviewUrl::External(
+            "about:blank"
+                .parse()
+                .map_err(|err| format!("invalid blank webview url: {err}"))?,
+        ),
+    )
+    .title("Codeforces 提交中")
+    .inner_size(960.0, 720.0)
+    .visible(true)
+    .resizable(true)
+    .center()
+    .on_page_load(move |window, payload| {
+        if payload.event() != PageLoadEvent::Finished {
+            return;
+        }
+
+        let url = payload.url().to_string();
+        if url.contains("__cf_chl") {
+            prompt_webview_submit_verification(
+                &submit_sender,
+                "Please complete the anti-bot verification in the opened Codeforces window, then click Submit again.".to_string(),
+                &window,
+            );
+            return;
+        }
+
+        if let Some(submission_id) = extract_submission_id_from_url(&url, contest_id) {
+            finish_webview_submit(&submit_sender, Ok(submission_id), &window);
+            return;
+        }
+
+        if !url.contains("/submit") {
+            return;
+        }
+
+        let mut state = submit_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.form_submitted {
+            state.form_submitted = true;
+            let _ = window.eval(submit_script.clone());
+        } else if !state.inspect_requested {
+            state.inspect_requested = true;
+            let _ = window.eval(inspect_script.clone());
+        }
+    })
+    .on_document_title_changed(move |window, title| {
+        if let Some(error) = title.strip_prefix("__BINGOOJ_SUBMIT_ERROR__:") {
+            prompt_webview_submit_verification(&title_sender, error.to_string(), &window);
+            return;
+        }
+        if title == "__BINGOOJ_SUBMITTING__" {
+            return;
+        }
+        if title.contains("Just a moment")
+            || title.contains("Please complete the anti-bot verification")
+        {
+            prompt_webview_submit_verification(
+                &title_sender,
+                "Please complete the anti-bot verification in the opened Codeforces window, then click Submit again.".to_string(),
+                &window,
+            );
+        }
+    })
+    .build()
+    .map_err(|err| format!("open Codeforces submit window failed: {err}"))?;
+    let _ = restore_codeforces_cookies(&app, &window);
+    window
+        .navigate(
+            submit_page_url
+                .parse()
+                .map_err(|err| format!("invalid Codeforces submit url: {err}"))?,
+        )
+        .map_err(|err| format!("navigate Codeforces submit window failed: {err}"))?;
+
+    let submission_id = tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(Duration::from_secs(30))
+            .map_err(|_| "Timed out while waiting for Codeforces to accept the submission.".to_string())?
+    })
+    .await
+    .map_err(|err| format!("Codeforces submit wait task failed: {err}"))??;
+
+    let submitted_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("read current time failed: {err}"))?
+        .as_secs();
+
+    Ok(serde_json::json!({
+        "submissionId": submission_id,
+        "submittedAt": submitted_at,
+        "message": format!("Submitted to Codeforces. Submission #{submission_id}. Waiting for verdict...")
+    }))
+}
+
+fn finish_webview_submit(
+    sender: &std::sync::Arc<Mutex<Option<std::sync::mpsc::SyncSender<Result<u64, String>>>>>,
+    result: Result<u64, String>,
+    window: &WebviewWindow,
+) {
+    let tx = sender
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(tx) = tx {
+        let _ = tx.send(result);
+    }
+    let _ = window.close();
+}
+
+fn prompt_webview_submit_verification(
+    sender: &std::sync::Arc<Mutex<Option<std::sync::mpsc::SyncSender<Result<u64, String>>>>>,
+    message: String,
+    window: &WebviewWindow,
+) {
+    let tx = sender
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(tx) = tx {
+        let _ = tx.send(Err(message));
+    }
+    let _ = window.set_title("Codeforces 验证");
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+fn codeforces_language_needles(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "cpp" => &["GNU G++23", "GNU G++20", "GNU G++17", "GNU C++17", "GNU G++14"],
+        "py" => &["Python 3", "PyPy 3"],
+        "js" => &["Node.js", "JavaScript"],
+        _ => &[],
+    }
+}
+
+fn build_codeforces_submit_script(
+    lang: &str,
+    problem_code: &str,
+    index: &str,
+    code: &str,
+) -> Result<String, serde_json::Error> {
+    let needles = serde_json::to_string(codeforces_language_needles(lang))?;
+    let problem_code = serde_json::to_string(problem_code)?;
+    let index = serde_json::to_string(index)?;
+    let code = serde_json::to_string(code)?;
+
+    Ok(format!(
+        r#"
+(() => {{
+  const compilerNeedles = {needles};
+  const problemCode = {problem_code};
+  const problemIndex = {index};
+  const sourceCode = {code};
+  const form = Array.from(document.querySelectorAll("form")).find((node) =>
+    node.querySelector('input[name="csrf_token"]') &&
+    node.querySelector('select[name="programTypeId"]')
+  );
+  if (!form) {{
+    document.title = "__BINGOOJ_SUBMIT_ERROR__:Codeforces submit form was not found.";
+    return;
+  }}
+
+  const setValue = (name, value) => {{
+    const field = form.querySelector(`[name="${{name}}"]`);
+    if (field) field.value = value;
+    return field;
+  }};
+
+  const compilerSelect = form.querySelector('select[name="programTypeId"]');
+  const compilerOption = Array.from(compilerSelect?.options || []).find((option) =>
+    compilerNeedles.some((needle) => option.textContent.includes(needle))
+  );
+  if (!compilerOption) {{
+    document.title = "__BINGOOJ_SUBMIT_ERROR__:No matching Codeforces compiler was found for this language.";
+    return;
+  }}
+
+  setValue("ftaa", window._ftaa ?? form.querySelector('[name="ftaa"]')?.value ?? "");
+  setValue("bfaa", window._bfaa ?? form.querySelector('[name="bfaa"]')?.value ?? "");
+  setValue("_tta", String(window._tta ?? form.querySelector('[name="_tta"]')?.value ?? "377"));
+  setValue("submittedProblemCode", problemCode);
+  setValue("submittedProblemIndex", problemIndex);
+  setValue("tabSize", "4");
+  setValue("sourceFile", "");
+  setValue("source", sourceCode);
+  compilerSelect.value = compilerOption.value;
+
+  const actionField = form.querySelector('[name="action"]');
+  if (actionField && !actionField.value) {{
+    actionField.value = "submitSolutionFormSubmitted";
+  }}
+
+  document.title = "__BINGOOJ_SUBMITTING__";
+  form.submit();
+}})();
+"#
+    ))
+}
+
+fn build_codeforces_submit_inspect_script() -> String {
+    r#"
+(() => {
+  const text = (node) => (node?.textContent || "").replace(/\s+/g, " ").trim();
+  const errorNode = Array.from(
+    document.querySelectorAll('.error, .error-message, .error[for="source"], .error.for__program-source')
+  ).find((node) => text(node).length > 0);
+  const errorText = text(errorNode);
+  if (errorText) {
+    document.title = `__BINGOOJ_SUBMIT_ERROR__:${errorText}`;
+    return;
+  }
+  document.title = `__BINGOOJ_SUBMIT_ERROR__:Codeforces returned to the submit page without creating a submission.`;
+})();
+"#
+    .to_string()
+}
+
+#[tauri::command]
+async fn cf_get_submission_status(
+    contest_id: u32,
+    index: String,
+    submission_id: Option<u64>,
+    submitted_after: u64,
+) -> Result<CodeforcesSubmissionStatus, String> {
+    let state = current_codeforces_auth_state();
+    let handle = state
+        .handle
+        .ok_or("Codeforces handle is not available yet. Please log in again.".to_string())?;
+
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 BingoOJ/0.1")
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|err| format!("build Codeforces status client failed: {err}"))?;
+
+    let url = format!(
+        "https://codeforces.com/api/user.status?handle={handle}&from=1&count=20"
+    );
+    let data = fetch_codeforces_api_json(&client, &url).await?;
+    let Some(entries) = data["result"].as_array() else {
+        return Err("Codeforces submission status API returned an unexpected payload".to_string());
+    };
+
+    let matched = if let Some(submission_id) = submission_id {
+        entries
+            .iter()
+            .find(|entry| entry["id"].as_u64() == Some(submission_id))
+    } else {
+        entries.iter().find(|entry| {
+            entry["contestId"].as_u64() == Some(contest_id as u64)
+                && entry["problem"]["index"].as_str() == Some(index.as_str())
+                && entry["creationTimeSeconds"].as_u64().unwrap_or_default()
+                    >= submitted_after.saturating_sub(7200)
+        })
+    };
+
+    let Some(entry) = matched else {
+        let recent_candidates = entries
+            .iter()
+            .filter(|entry| {
+                entry["contestId"].as_u64() == Some(contest_id as u64)
+                    && entry["problem"]["index"].as_str() == Some(index.as_str())
+            })
+            .take(3)
+            .map(|entry| {
+                format!(
+                    "#{} {} {}",
+                    entry["id"].as_u64().unwrap_or_default(),
+                    entry["creationTimeSeconds"].as_u64().unwrap_or_default(),
+                    entry["verdict"].as_str().unwrap_or("PENDING")
+                )
+            })
+            .collect::<Vec<_>>();
+
+        return Ok(CodeforcesSubmissionStatus {
+            found: false,
+            id: None,
+            verdict: None,
+            passed_test_count: None,
+            programming_language: None,
+            status_text: "Waiting for Codeforces to register the submission...".to_string(),
+            finished: false,
+            debug: Some(format!(
+                "handle={handle}, contest={contest_id}, index={index}, submission_id={submission_id:?}, submitted_after={submitted_after}, recent={}",
+                if recent_candidates.is_empty() {
+                    "none".to_string()
+                } else {
+                    recent_candidates.join(" | ")
+                }
+            )),
+        });
+    };
+
+    let verdict = entry["verdict"].as_str().map(|value| value.to_string());
+    let passed_test_count = entry["passedTestCount"].as_u64();
+    let programming_language = entry["programmingLanguage"]
+        .as_str()
+        .map(|value| value.to_string());
+
+    let finished = verdict
+        .as_deref()
+        .map(|value| value != "TESTING")
+        .unwrap_or(false);
+
+    let status_text = match verdict.as_deref() {
+        Some("OK") => format!(
+            "Accepted on Codeforces{}.",
+            passed_test_count
+                .map(|count| format!(" after {count} tests"))
+                .unwrap_or_default()
+        ),
+        Some("TESTING") => format!(
+            "Testing on Codeforces{}...",
+            passed_test_count
+                .map(|count| format!(" passed {count} tests"))
+                .unwrap_or_default()
+        ),
+        Some(verdict) => format!(
+            "{verdict} on Codeforces{}.",
+            passed_test_count
+                .map(|count| format!(" after {count} tests"))
+                .unwrap_or_default()
+        ),
+        None => "Submission is in queue on Codeforces...".to_string(),
+    };
+
+    Ok(CodeforcesSubmissionStatus {
+        found: true,
+        id: entry["id"].as_u64(),
+        verdict,
+        passed_test_count,
+        programming_language,
+        status_text,
+        finished,
+        debug: None,
+    })
 }
 
 #[tauri::command]
@@ -414,6 +1217,34 @@ async fn fetch_codeforces_html(client: &Client, url: &str) -> Result<String, Str
     .await
 }
 
+async fn fetch_codeforces_authed_html(
+    client: &Client,
+    url: &str,
+    cookie_header: &str,
+) -> Result<String, String> {
+    let response = client
+        .get(url)
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::PRAGMA, "no-cache")
+        .header(reqwest::header::REFERER, "https://codeforces.com/")
+        .header(reqwest::header::COOKIE, cookie_header)
+        .send()
+        .await
+        .map_err(|err| format!("request to Codeforces failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("Codeforces returned an error: {err}"))?;
+
+    response
+        .text()
+        .await
+        .map_err(|err| format!("read Codeforces response failed: {err}"))
+}
+
 async fn fetch_codeforces_api_json(client: &Client, url: &str) -> Result<serde_json::Value, String> {
     let mut last_error = String::new();
 
@@ -470,6 +1301,194 @@ async fn fetch_codeforces_api_json(client: &Client, url: &str) -> Result<serde_j
         .map_err(|err| format!("curl fallback returned invalid json: {err}"))
 }
 
+fn parse_submit_form_page(html: &str) -> Result<SubmitFormPage, String> {
+    let document = Html::parse_document(html);
+    let form_selector = Selector::parse("form").map_err(|err| err.to_string())?;
+    let input_selector = Selector::parse("input[name]").map_err(|err| err.to_string())?;
+    let option_selector =
+        Selector::parse("select[name='programTypeId'] option").map_err(|err| err.to_string())?;
+
+    let form = document
+        .select(&form_selector)
+        .find(|form| {
+            form.select(&input_selector).any(|input| {
+                input.value().attr("name") == Some("csrf_token")
+            }) && form.select(&option_selector).next().is_some()
+        })
+        .ok_or("Codeforces submit form was not found")?;
+
+    let mut hidden_fields = Vec::new();
+    let mut csrf_token = None;
+    for input in form.select(&input_selector) {
+        let Some(name) = input.value().attr("name") else {
+            continue;
+        };
+        let value = input.value().attr("value").unwrap_or_default().to_string();
+        if name == "csrf_token" {
+            csrf_token = Some(value.clone());
+        }
+        hidden_fields.push((name.to_string(), value));
+    }
+
+    let language_options = form
+        .select(&option_selector)
+        .filter_map(|option| {
+            let value = option.value().attr("value")?.trim().to_string();
+            if value.is_empty() {
+                return None;
+            }
+            let label = option.text().collect::<String>().trim().to_string();
+            Some((value, label))
+        })
+        .collect::<Vec<_>>();
+
+    let ftaa = hidden_field_value(&hidden_fields, "ftaa")
+        .or_else(|| extract_js_string_value(html, "_ftaa"));
+    let bfaa = hidden_field_value(&hidden_fields, "bfaa")
+        .or_else(|| extract_js_string_value(html, "_bfaa"));
+    let tta = hidden_field_value(&hidden_fields, "_tta")
+        .or_else(|| extract_js_number_value(html, "_tta"));
+
+    Ok(SubmitFormPage {
+        csrf_token: csrf_token.ok_or("Codeforces csrf token was not found")?,
+        hidden_fields,
+        language_options,
+        ftaa,
+        bfaa,
+        tta,
+    })
+}
+
+fn hidden_field_value(fields: &[(String, String)], name: &str) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|(field_name, value)| (field_name == name).then(|| value.clone()))
+}
+
+fn select_program_type_id(options: &[(String, String)], lang: &str) -> Option<String> {
+    let preferences: &[&str] = match lang {
+        "cpp" => &["GNU G++23", "GNU G++20", "GNU G++17", "GNU C++17", "GNU G++14"],
+        "py" => &["Python 3", "PyPy 3"],
+        "js" => &["Node.js", "JavaScript"],
+        _ => &[],
+    };
+
+    for needle in preferences {
+        if let Some((value, _)) = options
+            .iter()
+            .find(|(_, label)| label.contains(needle))
+        {
+            return Some(value.clone());
+        }
+    }
+
+    None
+}
+
+fn extract_codeforces_submit_error(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse(".error, .error-message, .error for__program-source").ok()?;
+
+    document.select(&selector).find_map(|node| {
+        let text = node.text().collect::<String>();
+        let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn extract_submission_id_from_html(html: &str, contest_id: u32) -> Option<u64> {
+    let needle = format!("/contest/{contest_id}/submission/");
+    let start = html.find(&needle)? + needle.len();
+    let digits = html[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+fn extract_submission_id_from_url(url: &str, contest_id: u32) -> Option<u64> {
+    let needle = format!("/contest/{contest_id}/submission/");
+    let start = url.find(&needle)? + needle.len();
+    let digits = url[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+fn extract_js_string_value(html: &str, var_name: &str) -> Option<String> {
+    let patterns = [
+        format!("window.{var_name} = \""),
+        format!("window.{var_name}='"),
+        format!("var {var_name} = \""),
+        format!("var {var_name}='"),
+        format!("{var_name} = \""),
+        format!("{var_name}='"),
+    ];
+
+    for pattern in patterns {
+        let Some(found_at) = html.find(&pattern) else {
+            continue;
+        };
+        let start = found_at + pattern.len();
+        let quote = pattern.chars().last()?;
+        let value = html[start..]
+            .chars()
+            .take_while(|ch| *ch != quote)
+            .collect::<String>();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+fn extract_js_number_value(html: &str, var_name: &str) -> Option<String> {
+    let patterns = [
+        format!("window.{var_name} = "),
+        format!("var {var_name} = "),
+        format!("{var_name} = "),
+    ];
+
+    for pattern in patterns {
+        let Some(found_at) = html.find(&pattern) else {
+            continue;
+        };
+        let start = found_at + pattern.len();
+        let value = html[start..]
+            .chars()
+            .skip_while(|ch| ch.is_whitespace())
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+fn looks_like_cloudflare_challenge(html: &str) -> bool {
+    html.contains("window._cf_chl_opt")
+        || html.contains("Enable JavaScript and cookies to continue")
+        || html.contains("<title>Just a moment...</title>")
+}
+
 async fn curl_fetch_text(
     url: String,
     accept: String,
@@ -521,8 +1540,23 @@ async fn curl_fetch_text(
 
 fn main() {
     tauri::Builder::default()
+        .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = restore_codeforces_cookies(app.handle(), &window);
+            }
+            let app_handle = app.handle().clone();
+            thread::spawn(move || {
+                let _ = refresh_codeforces_auth_state(&app_handle);
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             run_code,
+            cf_open_auth_window,
+            cf_get_auth_status,
+            cf_logout,
+            cf_submit_solution,
+            cf_get_submission_status,
             cf_fetch_problem,
             cf_list_problems,
             translate_problem_html,
@@ -625,17 +1659,20 @@ fn run_translation_install(from_lang: &str, to_lang: &str) -> Result<(), String>
     Ok(())
 }
 
-fn translation_support_root_dir() -> Result<PathBuf, String> {
+fn bingooj_data_root_dir() -> Result<PathBuf, String> {
     if let Some(xdg_data_home) = env::var_os("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(xdg_data_home).join("bingooj").join("translation"));
+        return Ok(PathBuf::from(xdg_data_home).join("bingooj"));
     }
 
     let home = env::var_os("HOME").ok_or("HOME is not set")?;
     Ok(PathBuf::from(home)
         .join(".local")
         .join("share")
-        .join("bingooj")
-        .join("translation"))
+        .join("bingooj"))
+}
+
+fn translation_support_root_dir() -> Result<PathBuf, String> {
+    Ok(bingooj_data_root_dir()?.join("translation"))
 }
 
 fn translation_support_runtime_dir() -> PathBuf {

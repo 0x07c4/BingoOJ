@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { cfListProblems } from "./oj/codeforces";
 import ReactMarkdown from "react-markdown";
 import Editor from "@monaco-editor/react";
@@ -347,6 +348,18 @@ export default function App() {
     logs: [],
   });
   const [problemDrafts, setProblemDrafts] = useState(() => readDrafts());
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [logoutBusy, setLogoutBusy] = useState(false);
+  const [connectError, setConnectError] = useState("");
+  const [submitBusy, setSubmitBusy] = useState(false);
+  const [authStatus, setAuthStatus] = useState({
+    connected: false,
+    checking: false,
+    expired: false,
+    handle: null,
+    last_url: null,
+    message: "提交前请先登录",
+  });
   const [output, setOutput] = useState("Ready.");
   const [selectedSampleIndex, setSelectedSampleIndex] = useState(0);
   const [sampleResults, setSampleResults] = useState([]);
@@ -393,6 +406,37 @@ export default function App() {
     })();
     return () => {
       alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    let unlistenPromise;
+
+    (async () => {
+      try {
+        const status = await invoke("cf_get_auth_status");
+        if (alive) {
+          setAuthStatus(status);
+          setConnectError("");
+        }
+      } catch (e) {
+        if (alive) {
+          setConnectError(String(e));
+        }
+      }
+
+      unlistenPromise = listen("cf-auth-status", (event) => {
+        if (!alive) return;
+        setAuthStatus(event.payload);
+      });
+    })();
+
+    return () => {
+      alive = false;
+      if (unlistenPromise) {
+        void unlistenPromise.then((unlisten) => unlisten());
+      }
     };
   }, []);
 
@@ -717,6 +761,40 @@ export default function App() {
     }));
   }
 
+  async function openCodeforcesLoginWindow() {
+    try {
+      setConnectBusy(true);
+      setConnectError("");
+      await invoke("cf_open_auth_window");
+      const status = await invoke("cf_get_auth_status");
+      setAuthStatus(status);
+      setConnectBusy(false);
+    } catch (e) {
+      setConnectBusy(false);
+      setConnectError(String(e));
+    }
+  }
+
+  async function logoutCodeforces() {
+    try {
+      setLogoutBusy(true);
+      setConnectError("");
+      await invoke("cf_logout");
+      setAuthStatus({
+        connected: false,
+        checking: false,
+        expired: false,
+        handle: null,
+        last_url: null,
+        message: "提交前请先登录",
+      });
+    } catch (error) {
+      setConnectError(String(error));
+    } finally {
+      setLogoutBusy(false);
+    }
+  }
+
   function updateCurrentDraft(updater) {
     if (!problem?.id) return;
 
@@ -808,6 +886,58 @@ export default function App() {
     setOutput(`Samples: ${passed}/${results.length} passed.`);
   }
 
+  async function submitSolution() {
+    if (!problem?.contestId || !problem?.index) {
+      setWorkspaceMode("custom");
+      setOutput("This problem cannot be submitted yet.");
+      return;
+    }
+
+    if (!authStatus.connected) {
+      setWorkspaceMode("custom");
+      setOutput("Please log in to Codeforces before submitting.");
+      return;
+    }
+
+    try {
+      setSubmitBusy(true);
+      setWorkspaceMode("custom");
+      const submitResult = await invoke("cf_submit_solution", {
+        contestId: problem.contestId,
+        index: problem.index,
+        lang,
+        code,
+      });
+      setOutput(String(submitResult.message ?? "Submitted to Codeforces."));
+
+      const startedAt = Number(submitResult.submittedAt ?? 0);
+      const submissionId =
+        submitResult.submissionId == null ? null : Number(submitResult.submissionId);
+      for (let attempt = 0; attempt < 45; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const status = await invoke("cf_get_submission_status", {
+          contestId: problem.contestId,
+          index: problem.index,
+          submissionId,
+          submittedAfter: startedAt,
+        });
+
+        const statusText = String(status.status_text ?? "Waiting for Codeforces verdict...");
+        const debugText = status.debug ? `\n\n[debug]\n${status.debug}` : "";
+        setOutput(`${statusText}${debugText}`);
+
+        if (status.finished) {
+          break;
+        }
+      }
+    } catch (e) {
+      setWorkspaceMode("custom");
+      setOutput(String(e));
+    } finally {
+      setSubmitBusy(false);
+    }
+  }
+
   function loadSampleToStdin(index) {
     const sample = samples[index];
     if (!sample) return;
@@ -858,51 +988,86 @@ export default function App() {
 
       <main className="main">
         <header className="topbar">
-          <div className="hgroup">
-            <div className="h1">{problem?.title}</div>
-            <div className="h2">
-              {problem?.source} · {problem?.id}
+          <div className="account-entry">
+            <div className={"account-badge " + (authStatus.connected ? "connected" : "")}>
+              Codeforces
             </div>
-          </div>
-
-          <div className="controls">
-            <div className="control-group">
-              <div className="control-label">Language</div>
-              <select
-                value={lang}
-                onChange={(e) => {
-                  const nextLang = e.target.value;
-                  updateCurrentDraft((current) => ({
-                    ...current,
-                    lang: nextLang,
-                  }));
-                }}
+            <div className="account-text">
+              {authStatus.checking
+                ? "正在检查登录状态..."
+                : authStatus.message}
+            </div>
+            <button
+              className="btn subtle account-btn"
+              onClick={openCodeforcesLoginWindow}
+              disabled={connectBusy || logoutBusy}
+            >
+              {connectBusy
+                ? "打开登录页..."
+                : authStatus.connected
+                  ? "切换账号"
+                  : authStatus.expired
+                    ? "重新登录"
+                    : "登录"}
+            </button>
+            {authStatus.connected ? (
+              <button
+                className="btn subtle account-btn"
+                onClick={logoutCodeforces}
+                disabled={logoutBusy || connectBusy}
               >
-                <option value="cpp">C++</option>
-                <option value="py">Python</option>
-                <option value="js">JavaScript</option>
-              </select>
+                {logoutBusy ? "退出中..." : "退出"}
+              </button>
+            ) : null}
+          </div>
+          <div className="topbar-main">
+            <div className="hgroup">
+              <div className="h1">{problem?.title}</div>
+              <div className="h2">
+                {problem?.source} · {problem?.id}
+              </div>
             </div>
-            <div className="control-group actions">
-              <div className="control-label">Actions</div>
-              <div className="action-row">
-                <button className="btn primary" onClick={runOnce}>
-                  Run
-                </button>
-                <button
-                  className="btn core"
-                  disabled
-                  title="Submit will be implemented next."
+            <div className="controls">
+              <div className="control-group">
+                <div className="control-label">语言</div>
+                <select
+                  value={lang}
+                  onChange={(e) => {
+                    const nextLang = e.target.value;
+                    updateCurrentDraft((current) => ({
+                      ...current,
+                      lang: nextLang,
+                    }));
+                  }}
                 >
-                  Submit
-                </button>
-                <button className="btn subtle" onClick={runSamples}>
-                  Run Samples
-                </button>
+                  <option value="cpp">C++</option>
+                  <option value="py">Python</option>
+                  <option value="js">JavaScript</option>
+                </select>
+              </div>
+              <div className="control-group actions">
+                <div className="control-label">运行</div>
+                <div className="action-row">
+                  <button className="btn primary" onClick={runOnce}>
+                    Run
+                  </button>
+                  <button
+                    className="btn core"
+                    onClick={submitSolution}
+                    disabled={submitBusy || !authStatus.connected}
+                    title={authStatus.connected ? "Submit to Codeforces" : "Log in to Codeforces to submit"}
+                  >
+                    {submitBusy ? "Submitting..." : "Submit"}
+                  </button>
+                  <button className="btn subtle" onClick={runSamples}>
+                    Run Samples
+                  </button>
+                </div>
               </div>
             </div>
           </div>
         </header>
+        {connectError ? <div className="topbar-note">{connectError}</div> : null}
 
         <section className="content">
           <div className="panel statement">
@@ -1038,179 +1203,184 @@ export default function App() {
             )}
           </div>
 
-          <div className="panel editor">
-            <Editor
-              height="100%"
-              language={currentLanguage.editorLanguage}
-              value={code}
-              onChange={(v) => updateCode(v ?? "")}
-              theme="vs-dark"
-              options={{
-                automaticLayout: true,
-                fontSize: 14,
-                minimap: { enabled: false },
-                scrollBeyondLastLine: false,
-                scrollbar: {
-                  alwaysConsumeMouseWheel: false,
-                },
-              }}
-            />
-          </div>
-
-          <div className="panel output">
-            <div className="workspace-tabs">
-              <button
-                className={"workspace-tab " + (workspaceMode === "samples" ? "active" : "")}
-                onClick={() => setWorkspaceMode("samples")}
-              >
-                Samples
-              </button>
-              <button
-                className={"workspace-tab " + (workspaceMode === "custom" ? "active" : "")}
-                onClick={() => setWorkspaceMode("custom")}
-              >
-                Custom Test
-              </button>
+          <div className="workspace-column">
+            <div className="workspace-editor">
+              <div className="workspace-section-head">
+                <div className="workspace-section-title">Code</div>
+                <div className="workspace-section-meta">{currentLanguage.label}</div>
+              </div>
+              <div className="editor-surface">
+                <Editor
+                  height="100%"
+                  language={currentLanguage.editorLanguage}
+                  value={code}
+                  onChange={(v) => updateCode(v ?? "")}
+                  theme="vs-dark"
+                  options={{
+                    automaticLayout: true,
+                    fontSize: 14,
+                    minimap: { enabled: false },
+                    scrollBeyondLastLine: false,
+                    scrollbar: {
+                      alwaysConsumeMouseWheel: false,
+                    },
+                  }}
+                />
+              </div>
             </div>
 
-            {workspaceMode === "samples" ? (
-              <div className="sample-panel">
-                <div className="sample-header">
-                  <div>
-                    <div className="section-title">Samples</div>
-                    <div className="sample-subtitle">
-                      {sampleResults.length > 0
-                        ? `${passedSamples} / ${sampleResults.length} passed`
-                        : `${samples.length} cases`}
+            <div className="workspace-output">
+              <div className="workspace-output-head">
+                <div className="workspace-section-title">Tests</div>
+                <div className="workspace-tabs">
+                  <button
+                    className={"workspace-tab " + (workspaceMode === "samples" ? "active" : "")}
+                    onClick={() => setWorkspaceMode("samples")}
+                  >
+                    Samples
+                  </button>
+                  <button
+                    className={"workspace-tab " + (workspaceMode === "custom" ? "active" : "")}
+                    onClick={() => setWorkspaceMode("custom")}
+                  >
+                    Custom Test
+                  </button>
+                </div>
+              </div>
+
+              <div className="workspace-output-body">
+                {workspaceMode === "samples" ? (
+                <div className="sample-panel">
+                  <div className="sample-header">
+                    <div>
+                      <div className="section-title">Samples</div>
+                      <div className="sample-subtitle">
+                        {sampleResults.length > 0
+                          ? `${passedSamples} / ${sampleResults.length} passed`
+                          : `${samples.length} cases`}
+                      </div>
                     </div>
+                    {selectedResult ? (
+                      <div className={"sample-inline-status " + (selectedResult.ok ? "pass" : "fail")}>
+                        <span className="status-dot" />
+                        <span>{selectedResult.ok ? "Passed" : "Failed"}</span>
+                      </div>
+                    ) : null}
                   </div>
-                  {selectedResult ? (
-                    <div className={"sample-inline-status " + (selectedResult.ok ? "pass" : "fail")}>
-                      <span className="status-dot" />
-                      <span>{selectedResult.ok ? "Passed" : "Failed"}</span>
+                  {samples.length > 1 ? (
+                    <div className="sample-tabs">
+                      {samples.map((sample, index) => {
+                        const result = sampleResults.find((item) => item.index === index);
+                        return (
+                          <button
+                            key={`${problem?.id}-sample-${index}`}
+                            className={"sample-tab " + (index === selectedSampleIndex ? "active" : "")}
+                            onClick={() => loadSampleToStdin(index)}
+                          >
+                            <span className="sample-tab-title">Sample {index + 1}</span>
+                            {result ? (
+                              <span className={"sample-status " + (result.ok ? "pass" : "fail")}>
+                                {result.ok ? "AC" : "WA"}
+                              </span>
+                            ) : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                  {selectedSample ? (
+                    <div className="sample-meta">
+                      <div className="sample-title">Sample {selectedSampleIndex + 1}</div>
+                    </div>
+                  ) : null}
+                  {selectedSample ? (
+                    <div className="sample-detail sample-detail-triple">
+                      <div>
+                        <div className="label">Input</div>
+                        <pre>{selectedSample.input}</pre>
+                      </div>
+                      <div>
+                        <div className="label">Expected Output</div>
+                        <pre>{selectedSample.output}</pre>
+                      </div>
+                      <div>
+                        <div className="label">{selectedResult?.error ? "Runtime Error" : "Got"}</div>
+                        <pre>{selectedResult ? selectedResult.error || selectedResult.got : "Run Samples to evaluate this case."}</pre>
+                      </div>
+                    </div>
+                  ) : null}
+                  {selectedDiff ? (
+                    <div className="diff-panel">
+                      <div className="diff-summary">
+                        First difference at line {selectedDiff.firstMismatchLine}.
+                      </div>
+                      <div className="diff-table">
+                        <div className="diff-table-head">Expected</div>
+                        <div className="diff-table-head">Got</div>
+                        {selectedDiff.rows.map((row) => (
+                          <Fragment key={`diff-row-${row.lineNumber}`}>
+                            <div
+                              className={"diff-cell " + (row.matches ? "" : "mismatch")}
+                            >
+                              <span className="diff-line-number">{row.lineNumber}</span>
+                              <span className="diff-line-text">{row.expected || " "}</span>
+                            </div>
+                            <div
+                              className={"diff-cell " + (row.matches ? "" : "mismatch")}
+                            >
+                              <span className="diff-line-number">{row.lineNumber}</span>
+                              <span className="diff-line-text">{row.got || " "}</span>
+                            </div>
+                          </Fragment>
+                        ))}
+                      </div>
+                    </div>
+                  ) : !selectedResult ? (
+                    <div className="sample-empty-state">
+                      <div className="sample-empty-title">Run Samples to compare this case.</div>
+                      <div className="sample-empty-body">
+                        You will see the actual output and the first mismatch here.
+                      </div>
                     </div>
                   ) : null}
                 </div>
-                {samples.length > 1 ? (
-                  <div className="sample-tabs">
-                    {samples.map((sample, index) => {
-                      const result = sampleResults.find((item) => item.index === index);
-                      return (
-                        <button
-                          key={`${problem?.id}-sample-${index}`}
-                          className={"sample-tab " + (index === selectedSampleIndex ? "active" : "")}
-                          onClick={() => loadSampleToStdin(index)}
-                        >
-                          <span className="sample-tab-title">Sample {index + 1}</span>
-                          {result ? (
-                            <span className={"sample-status " + (result.ok ? "pass" : "fail")}>
-                              {result.ok ? "AC" : "WA"}
-                            </span>
-                          ) : null}
-                        </button>
-                      );
-                    })}
-                  </div>
-                ) : null}
-                {selectedSample ? (
-                  <div className="sample-meta">
-                    <div className="sample-title">Sample {selectedSampleIndex + 1}</div>
-                  </div>
-                ) : null}
-                {selectedSample ? (
-                  <div className="sample-detail sample-detail-triple">
+              ) : (
+                <div className="custom-panel">
+                  <div className="custom-header">
                     <div>
-                      <div className="label">Input</div>
-                      <pre>{selectedSample.input}</pre>
-                    </div>
-                    <div>
-                      <div className="label">Expected Output</div>
-                      <pre>{selectedSample.output}</pre>
-                    </div>
-                    <div>
-                      <div className="label">{selectedResult?.error ? "Runtime Error" : "Got"}</div>
-                      <pre>{selectedResult ? selectedResult.error || selectedResult.got : "Run Samples to evaluate this case."}</pre>
+                      <div className="section-title">Custom Test</div>
+                      <div className="sample-subtitle">Edit input here, then use Run.</div>
                     </div>
                   </div>
-                ) : null}
-                {selectedDiff ? (
-                  <div className="diff-panel">
-                    <div className="diff-summary">
-                      First difference at line {selectedDiff.firstMismatchLine}.
+                  <div className="custom-sections">
+                    <div className="io-section">
+                      <div className="io-header">
+                        <div className="label">Input</div>
+                      </div>
+                      <textarea
+                        className="workspace-textarea"
+                        value={stdin}
+                        onChange={(e) => {
+                          const nextStdin = e.target.value;
+                          updateCurrentDraft((current) => ({
+                            ...current,
+                            stdin: nextStdin,
+                            hasEditedStdin: true,
+                          }));
+                        }}
+                      />
                     </div>
-                    <div className="diff-table">
-                      <div className="diff-table-head">Expected</div>
-                      <div className="diff-table-head">Got</div>
-                      {selectedDiff.rows.map((row) => (
-                        <Fragment key={`diff-row-${row.lineNumber}`}>
-                          <div
-                            className={"diff-cell " + (row.matches ? "" : "mismatch")}
-                          >
-                            <span className="diff-line-number">{row.lineNumber}</span>
-                            <span className="diff-line-text">{row.expected || " "}</span>
-                          </div>
-                          <div
-                            className={"diff-cell " + (row.matches ? "" : "mismatch")}
-                          >
-                            <span className="diff-line-number">{row.lineNumber}</span>
-                            <span className="diff-line-text">{row.got || " "}</span>
-                          </div>
-                        </Fragment>
-                      ))}
+                    <div className="io-section">
+                      <div className="io-header">
+                        <div className="label">Output</div>
+                      </div>
+                      <pre className="out">{output}</pre>
                     </div>
-                  </div>
-                ) : !selectedResult ? (
-                  <div className="sample-empty-state">
-                    <div className="sample-empty-title">Run Samples to compare this case.</div>
-                    <div className="sample-empty-body">
-                      You will see the actual output and the first mismatch here.
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="custom-panel">
-                <div className="custom-header">
-                  <div>
-                    <div className="section-title">Custom Test</div>
-                    <div className="sample-subtitle">Edit input here, then use Run.</div>
                   </div>
                 </div>
-                <div className="custom-sections">
-                  <div className="io-section">
-                    <div className="io-header">
-                      <div className="label">Input</div>
-                    </div>
-                    <textarea
-                      value={stdin}
-                      onChange={(e) => {
-                        const nextStdin = e.target.value;
-                        updateCurrentDraft((current) => ({
-                          ...current,
-                          stdin: nextStdin,
-                          hasEditedStdin: true,
-                        }));
-                      }}
-                      style={{
-                        width: "100%",
-                        height: "100%",
-                        borderRadius: 12,
-                        border: "1px solid #232323",
-                        background: "#0e0e0e",
-                        color: "inherit",
-                        padding: 10,
-                      }}
-                    />
-                  </div>
-                  <div className="io-section">
-                    <div className="io-header">
-                      <div className="label">Output</div>
-                    </div>
-                    <pre className="out">{output}</pre>
-                  </div>
-                </div>
+              )}
               </div>
-            )}
+            </div>
           </div>
         </section>
       </main>
